@@ -1,0 +1,208 @@
+import sys
+print(sys.executable)
+
+from osgeo import gdal
+import gspread
+from google.oauth2.service_account import Credentials
+import pandas as pd
+import rasterio
+import os
+import schedule
+import time
+import requests as req
+from rasterio.mask import mask
+import geopandas as gpd
+from rasterstats import zonal_stats
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import re
+from shapely.geometry import Polygon
+import json
+from datetime import datetime, timedelta
+
+# Define paths, coordinates, and EarthData login
+earthdata_username = 'Ashley.Agatep'
+earthdata_password = 'AATTEEMM0625a-'
+shapefile_path = r'C:\Users\aagatep\Documents\Data\Analyzing_HABS\Shapefile_Layers\DiamondValleyLake\DiamondValleyLake.shp'
+google_sheet_name = 'HABS_API'
+service_account_file = r'C:\Users\aagatep\Documents\Python\API_KEYS\vigilant-router-438202-r1-ce7328cfec69.json'
+main_folder_id = '1wOtXJdsSHK5S4LFOULR1Tubg1rREPo3j'
+aoi_coords = (-117.07937, 33.64466, -116.96904, 33.73234)
+print("Environment setup complete")
+
+# Define OAuth Scopes
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',  # Full access to Google Sheets
+    'https://www.googleapis.com/auth/drive'          # Full access to Google Drive
+]
+
+# AUTHENTICATION FUNCTIONS
+def authenticate_google_drive():
+    creds = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
+    drive_service = build('drive', 'v3', credentials=creds)
+    return drive_service
+
+def authenticate_google_sheets(sheet_name):
+    creds = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    sheet = client.open(sheet_name).sheet1
+    return sheet
+
+print("Authentication functions defined.")
+
+# ADDITIONAL FUNCTIONS
+def simplify_shapefile(input_shapefile, output_shapefile, tolerance=0.01):
+    shapefile = gpd.read_file(input_shapefile)
+    simplified = shapefile.copy()
+    simplified["geometry"] = simplified.geometry.simplify(tolerance, preserve_topology=True)
+    simplified.to_file(output_shapefile, driver="ESRI Shapefile")
+    return output_shapefile
+
+def reproject_shapefile(input_shapefile, output_shapefile, target_crs):
+    shapefile = gpd.read_file(input_shapefile)
+    reprojected = shapefile.to_crs(target_crs)
+    reprojected.to_file(output_shapefile, driver="ESRI Shapefile")
+    return reprojected
+
+def clip_raster_to_shapefile(raster_path, shapefile_path, output_path):
+    with rasterio.open(raster_path) as src:
+        shapefile = gpd.read_file(shapefile_path)
+        shapes = [geom for geom in shapefile.geometry]
+        out_image, out_transform = mask(src, shapes, crop=True)
+        out_meta = src.meta.copy()
+        out_meta.update({
+            "driver": "GTiff",
+            "height": out_image.shape[1],
+            "width": out_image.shape[2],
+            "transform": out_transform
+        })
+        with rasterio.open(output_path, "w", **out_meta) as dest:
+            dest.write(out_image)
+    return output_path
+
+def reduce_raster_resolution(raster_path, output_path, scale_factor=2):
+    with rasterio.open(raster_path) as src:
+        data = src.read(
+            out_shape=(
+                src.count,
+                int(src.height / scale_factor),
+                int(src.width / scale_factor)
+            ),
+            resampling=rasterio.enums.Resampling.average
+        )
+        transform = src.transform * src.transform.scale(
+            (src.width / data.shape[-1]),
+            (src.height / data.shape[-2])
+        )
+        out_meta = src.meta.copy()
+        out_meta.update({
+            "height": data.shape[1],
+            "width": data.shape[2],
+            "transform": transform
+        })
+        with rasterio.open(output_path, "w", **out_meta) as dest:
+            dest.write(data)
+    return output_path
+
+def download_ecostress_data(aoi_coords, time_range, local_download_folder, task_name='ECOSTRESS_download'):
+    """
+    Downloads ECOSTRESS data using AppEEARS API.
+    """
+    user = earthdata_username
+    password = earthdata_password
+    api = 'https://appeears.earthdatacloud.nasa.gov/api/'
+    token_response = req.post(f'{api}login', auth=(user, password)).json()
+    token = token_response['token']
+    head = {'Authorization': f'Bearer {token}'}
+
+    prods = ['ECO2LSTE.001', 'ECO_L2_LSTE.002']
+    layers = [(prods[1], 'LST'), (prods[1], 'QC'), (prods[1], 'cloud_mask')]
+    prodLayer = [{"layer": l[1], "product": l[0]} for l in layers]
+
+    polyg = Polygon([[aoi_coords[0], aoi_coords[1]], [aoi_coords[2], aoi_coords[1]], [aoi_coords[2], aoi_coords[3]], [aoi_coords[0], aoi_coords[3]]])
+    aoi_df = gpd.GeoDataFrame(pd.DataFrame(columns=['bbox']), crs='epsg:4326', geometry=[polyg])
+    aoi_json = json.loads(aoi_df.to_json())
+
+    startYear, startMonth, startDay = time_range[0][:4], time_range[0][5:7], time_range[0][8:]
+    endYear, endMonth, endDay = time_range[1][:4], time_range[1][5:7], time_range[1][8:]
+    task = {
+        'task_type': 'area',
+        'task_name': task_name,
+        'params': {
+            'dates': [{'startDate': f'{startMonth}-{startDay}-{startYear}', 'endDate': f'{endMonth}-{endDay}-{endYear}'}],
+            'layers': prodLayer,
+            'output': {'format': {'type': 'geotiff'}, 'projection': 'geographic'},
+            'geo': aoi_json
+        }
+    }
+
+    task_response = req.post(f'{api}task', json=task, headers=head).json()
+    task_id = task_response['task_id']
+
+    while req.get(f'{api}task/{task_id}', headers=head).json()['status'] != 'done':
+        time.sleep(30)
+
+    if not os.path.exists(local_download_folder):
+        os.makedirs(local_download_folder)
+
+    bundle = req.get(f'{api}bundle/{task_id}', headers=head).json()
+    for f in bundle['files']:
+        dl = req.get(f'{api}bundle/{task_id}/{f["file_id"]}', headers=head, stream=True)
+        filepath = os.path.join(local_download_folder, f['file_name'].split('/')[-1])
+        with open(filepath, 'wb') as file:
+            for data in dl.iter_content(chunk_size=8192):
+                file.write(data)
+    return local_download_folder
+
+def update_google_sheets(data, sheet_name, tif_name):
+    print("Updating Google Sheets...")
+    sheet = authenticate_google_sheets(sheet_name)
+    df = pd.DataFrame(data)
+
+    # Add metadata to each row (e.g., raster filename)
+    df['RASTER_NAME'] = tif_name
+    print(f"Data to upload:\n{df}")
+
+    # Add column names and update the sheet
+    sheet.update([df.columns.values.tolist()] + df.values.tolist())
+    print("Google Sheets updated successfully.")
+
+print("Preprocessing and ECOSTRESS functions defined.")
+
+# MAIN WORKFLOW
+def main():
+    def get_weekly_time_range():
+        end_date = datetime(2024, 1, 13)
+        start_date = end_date - timedelta(days=7)
+        return [start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")]
+
+    local_folder = "./local_analysis"
+    os.makedirs(local_folder, exist_ok=True)
+
+    local_download_folder = "./local_downloads"
+    os.makedirs(local_download_folder, exist_ok=True)
+
+    time_range = get_weekly_time_range()
+    download_ecostress_data(aoi_coords, time_range, local_download_folder)
+
+    raster_files = [f for f in os.listdir(local_download_folder) if f.startswith('ECO_L2_LSTE') and 'LST' in f and f.endswith('.tif')]
+    if not raster_files:
+        raise FileNotFoundError("No LST raster files found in the local download folder.")
+
+    raster_path = os.path.join(local_download_folder, raster_files[0])
+
+    simplified_shapefile = simplify_shapefile(shapefile_path, os.path.join(local_folder, "simplified_shapefile.shp"))
+    reprojected_shapefile = reproject_shapefile(simplified_shapefile, os.path.join(local_folder, "reprojected_shapefile.shp"), target_crs=rasterio.open(raster_path).crs)
+
+    clipped_raster_path = clip_raster_to_shapefile(raster_path, reprojected_shapefile, os.path.join(local_folder, "clipped_raster.tif"))
+    reduced_raster_path = reduce_raster_resolution(clipped_raster_path, os.path.join(local_folder, "reduced_raster.tif"))
+
+    stats = zonal_stats(reprojected_shapefile, reduced_raster_path, stats=["mean", "median"])
+
+    update_google_sheets(stats, google_sheet_name, os.path.basename(raster_path))
+
+    for file in os.listdir(local_download_folder):
+        os.remove(os.path.join(local_download_folder, file))
+
+main()
+print("Main workflow executed successfully.")
