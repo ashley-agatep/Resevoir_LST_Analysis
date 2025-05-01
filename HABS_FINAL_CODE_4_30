@@ -1,0 +1,305 @@
+import sys
+print(sys.executable)
+
+from osgeo import gdal
+import gspread
+from google.oauth2.service_account import Credentials
+import pandas as pd
+import rasterio
+import os
+import time
+import requests as req
+import geopandas as gpd
+from rasterstats import zonal_stats
+from googleapiclient.discovery import build
+import json
+from shapely.geometry import Polygon
+from datetime import datetime, timedelta
+import dask.array as da
+from rasterio.vrt import WarpedVRT
+from arcgis.gis import GIS
+
+# Define paths, coordinates, and EarthData login
+earthdata_username = 'Ashley.Agatep'
+earthdata_password = 'AATTEEMM0625a-'
+shapefile_path = r'C:\Users\aagatep\Documents\Data\Analyzing_HABS\Shapefile_Layers\DiamondValleyLake\DiamondValleyLake.shp'
+google_sheet_name = 'HABS_API'
+service_account_file = r'C:\Users\aagatep\Documents\Python\API_KEYS\vigilant-router-438202-r1-ce7328cfec69.json'
+main_folder_id = '1wOtXJdsSHK5S4LFOULR1Tubg1rREPo3j'
+aoi_coords = (-117.07937, 33.64466, -116.96904, 33.73234)
+arcgis_portal = "https://chapman.maps.arcgis.com"
+arcgis_item_id = "9b3ddd9d32434c1191eba7b6b6dcc4f7"
+client_id = "FBcgyFqs6ixsNRaD"
+client_secret = "8f465ded13f841838fb093d80c33a1f0"
+
+print("Environment setup complete")
+
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+
+def authenticate_google_drive():
+    creds = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
+    return build('drive', 'v3', credentials=creds)
+
+def authenticate_google_sheets(sheet_name):
+    creds = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    return client.open(sheet_name).sheet1
+
+def authenticate_arcgis():
+    gis = GIS(arcgis_portal, client_id=client_id, client_secret=client_secret)
+    print("Authenticated to ArcGIS Online using client credentials.")
+    return gis
+
+def download_ecostress_data(aoi_coords, time_range, local_download_folder, task_name='ECOSTRESS_download'):
+    user = earthdata_username
+    password = earthdata_password
+    api = 'https://appeears.earthdatacloud.nasa.gov/api/'
+    token_response = req.post(f'{api}login', auth=(user, password)).json()
+    if 'token' not in token_response:
+        raise ValueError(f"Failed to retrieve API token: {token_response}")
+    token = token_response['token']
+    head = {'Authorization': f'Bearer {token}'}
+    prods = ['ECO2LSTE.001', 'ECO_L2_LSTE.002']
+    layers = [(prods[1], 'LST')]
+    prodLayer = [{"layer": l[1], "product": l[0]} for l in layers]
+    polyg = Polygon([
+        [aoi_coords[0], aoi_coords[1]],
+        [aoi_coords[2], aoi_coords[1]],
+        [aoi_coords[2], aoi_coords[3]],
+        [aoi_coords[0], aoi_coords[3]]
+    ])
+    aoi_df = gpd.GeoDataFrame(pd.DataFrame(columns=['bbox']), crs='epsg:4326', geometry=[polyg])
+    aoi_json = json.loads(aoi_df.to_json())
+    startYear, startMonth, startDay = time_range[0][:4], time_range[0][5:7], time_range[0][8:]
+    endYear, endMonth, endDay = time_range[1][:4], time_range[1][5:7], time_range[1][8:]
+    task = {
+        'task_type': 'area',
+        'task_name': task_name,
+        'params': {
+            'dates': [{'startDate': f'{startMonth}-{startDay}-{startYear}', 'endDate': f'{endMonth}-{endDay}-{endYear}'}],
+            'layers': prodLayer,
+            'output': {'format': {'type': 'geotiff'}, 'projection': 'geographic'},
+            'geo': aoi_json
+        }
+    }
+    task_response = req.post(f'{api}task', json=task, headers=head).json()
+    if 'task_id' not in task_response:
+        raise ValueError(f"Failed to create task: {task_response}")
+    task_id = task_response['task_id']
+    while req.get(f'{api}task/{task_id}', headers=head).json().get('status') != 'done':
+        time.sleep(30)
+    if not os.path.exists(local_download_folder):
+        os.makedirs(local_download_folder)
+    bundle = req.get(f'{api}bundle/{task_id}', headers=head).json()
+    if 'files' not in bundle:
+        raise ValueError(f"Failed to retrieve files: {bundle}")
+    for f in bundle['files']:
+        if "LST" in f["file_name"]:
+            dl = req.get(f'{api}bundle/{task_id}/{f["file_id"]}', headers=head, stream=True)
+            filepath = os.path.join(local_download_folder, f['file_name'].split('/')[-1])
+            with open(filepath, 'wb') as file:
+                for data in dl.iter_content(chunk_size=8192):
+                    file.write(data)
+    return local_download_folder
+
+def process_raster_with_dask(raster_path):
+    with rasterio.open(raster_path) as src:
+        with WarpedVRT(src) as vrt:
+            dask_raster = da.from_array(vrt.read(), chunks=(1, 1024, 1024))
+            return float(dask_raster.mean(axis=(1, 2)).compute())
+
+def get_weekly_time_range():
+    today = datetime.utcnow()
+    start = today - timedelta(days=7)
+    return [start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")]
+
+def extract_datetime_from_filename(filename):
+    try:
+        parts = filename.split("_doy")[1]
+        year = int(parts[:4])
+        day_of_year = int(parts[4:7])
+        hour = int(parts[7:9])
+        minute = int(parts[9:11])
+        second = int(parts[11:13])
+        date = datetime(year, 1, 1) + timedelta(days=day_of_year - 1)
+        dt_utc = datetime(year, date.month, date.day, hour, minute, second)
+        dt_pst = dt_utc - timedelta(hours=7)
+        return dt_pst.year, dt_pst.month, dt_pst.day, dt_pst.hour, dt_pst.minute, dt_pst.second
+    except Exception as e:
+        print(f"Error parsing filename {filename}: {e}")
+        return None, None, None, None, None, None
+
+def categorize_temperature(scaled_temp):
+    if scaled_temp < 293.15:
+        return "Low"
+    elif 293.16 <= scaled_temp <= 298.15:
+        return "Medium"
+    else:
+        return "High"
+
+def load_google_sheets_data(sheet_name):
+    creds = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    sheet = client.open(sheet_name).sheet1
+    data = sheet.get_all_values()
+    return pd.DataFrame(data[1:], columns=data[0])
+
+def update_arcgis_layer(sheet_name, feature_layer):
+    df = load_google_sheets_data(sheet_name)
+    df.columns = df.columns.str.strip()  # Clean up column names
+
+    # Ensure numeric columns are properly formatted
+    df['Mean'] = pd.to_numeric(df['Mean'], errors='coerce').fillna(0.0)
+    df['Mean_C'] = pd.to_numeric(df['Mean_C'], errors='coerce').fillna(0.0)
+    df['Risk'] = df['Risk'].fillna('Unknown')  # Fill missing Risk values
+
+    # Debugging: Print the first few rows of the DataFrame
+    print("Google Sheets DataFrame (first 5 rows):")
+    print(df.head())
+
+    # Skip duplicate check for testing purposes
+    existing_records = feature_layer.query().sdf
+    if "Raster Name" not in df.columns or "Raster_Name" not in existing_records.columns:
+        print("ERROR: Column mismatch between Google Sheet and ArcGIS layer.")
+        return
+    new_records = df[~df["Raster Name"].isin(existing_records["Raster_Name"])]
+
+    # For testing, use all records from the Google Sheet
+    new_records = df
+
+    if new_records.empty:
+        print("No records to update in ArcGIS.")
+        return
+
+    print(f"Appending {len(new_records)} records to ArcGIS Online.")
+
+    # Prepare features for ArcGIS
+    features = []
+    for _, row in new_records.iterrows():
+        features.append({
+         "attributes": {
+            "Mean": row["Mean"],  # Previously "Scaled_LST"
+            "Mean_C": row["Mean_C"],  # Previously "Mean_Celsius"
+            "Raster_Name": row["Raster Name"],
+            "Risk": row["Risk"],  # Previously "Category"
+            "Year": row["Year"],
+            "Month": row["Month"],
+            "Day": row["Day"],
+            "Hour": row["Hour"],
+            "Minute": row["Minute"],
+            "Second": row["Second"],
+            "YYYYMMDD": f"{row['Year']}{row['Month']:0>2}{row['Day']:0>2}"
+        }
+    })
+
+    # Debugging: Print the first feature being sent to ArcGIS
+    print("First feature being sent to ArcGIS:")
+    print(features[0])
+
+    # Update the ArcGIS layer
+    feature_layer.edit_features(adds=features)
+    print("ArcGIS Online feature layer successfully updated with new data!")
+
+
+def main():
+    local_download_folder = "./local_downloads"
+    os.makedirs(local_download_folder, exist_ok=True)
+    time_range = get_weekly_time_range()
+    download_ecostress_data(aoi_coords, time_range, local_download_folder)
+    for f in os.listdir(local_download_folder):
+        if "_QC_" in f or "_cloud_mask_" in f:
+            os.remove(os.path.join(local_download_folder, f))
+            print(f"Deleted unnecessary file: {f}")
+    raster_files = sorted(
+        [f for f in os.listdir(local_download_folder) if "_LST_" in f and f.endswith('.tif')],
+        key=lambda x: os.path.getmtime(os.path.join(local_download_folder, x)),
+        reverse=True
+    )
+    if not raster_files:
+        raise FileNotFoundError("No valid LST raster files found after cleanup.")
+
+    sheet = authenticate_google_sheets(google_sheet_name)
+
+    log_csv_path = os.path.join(local_download_folder, "ecostress_log.csv")
+    csv_columns = ["Scaled_LST", "Mean_Celsius", "Raster_Name", "Category", "Year", "Month", "Day", "Hour", "Minute", "Second", "YYYYMMDD"]
+    log_df = pd.DataFrame(columns=csv_columns)
+
+    for raster_filename in raster_files:
+        raster_path = os.path.join(local_download_folder, raster_filename)
+        print(f"Processing raster: {raster_filename}")
+        mean_temperature = process_raster_with_dask(raster_path)
+        scaled_temperature = (mean_temperature * 0.02) + 0.49
+        mean_celsius = scaled_temperature - 273.15
+
+        # Apply the above-0 filter
+        if scaled_temperature <= 0 or mean_celsius <= 0:
+            print(f"  Skipping raster {raster_filename} due to non-positive temperature values.")
+            continue
+
+        category = categorize_temperature(scaled_temperature)
+
+        print(f"  Mean (scaled): {scaled_temperature:.2f} K")
+        print(f"  Mean (Celsius): {mean_celsius:.2f} °C")
+        print(f"  Risk Level: {category}")
+
+        year, month, day, hour, minute, second = extract_datetime_from_filename(raster_filename)
+        month = f"{month:02d}"
+        day = f"{day:02d}"
+        hour = f"{hour:02d}"
+        minute = f"{minute:02d}"
+        second = f"{second:02d}"
+        yyyymmdd = f"{year}{month}{day}"
+
+        header = sheet.row_values(1)
+        record_dict = {
+            "Mean": scaled_temperature,
+            "Mean_C": mean_celsius,
+            "Raster Name": raster_filename,
+            "Risk": category,
+            "Year": year,
+            "Month": month,
+            "Day": day,
+            "Hour": hour,
+            "Minute": minute,
+            "Second": second,
+            "YYYYMMDD": yyyymmdd
+        }
+        ordered_row = [record_dict.get(col, '') for col in header]
+        sheet.append_rows([ordered_row])
+
+        log_df.loc[len(log_df)] = [
+            scaled_temperature,
+            mean_celsius,
+            raster_filename,
+            category,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            yyyymmdd
+        ]
+
+    log_df.to_csv(log_csv_path, index=False)
+    print(f"Logged all processed values to CSV: {log_csv_path}")
+
+    print("All LST data processed and appended to Google Sheets.")
+    gis = authenticate_arcgis()
+    item = gis.content.get(arcgis_item_id)
+    print(f"Item Title: {item.title}")
+    print(f"Item Type: {item.type}")
+    print(f"Item URL: {item.url}")
+    print(f"Item has layers: {hasattr(item, 'layers')}")
+    print(f"Number of layers: {len(item.layers) if hasattr(item, 'layers') else 'N/A'}")
+    print(f"Item has tables: {hasattr(item, 'tables')}")
+    print(f"Number of tables: {len(item.tables) if hasattr(item, 'tables') else 'N/A'}")
+
+    feature_layer = item.tables[0]
+    update_arcgis_layer(google_sheet_name, feature_layer)
+
+main()
+print("Main workflow executed successfully.")  
